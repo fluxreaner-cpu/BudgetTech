@@ -39,7 +39,7 @@ type UserRow = {
   user_id: string; email: string; name: string; password_hash: string;
   salt: string | null; hash_iterations: number | null; created_at: Date;
   last_active_at: Date | null; is_verified: boolean; avatar_seed: string;
-  session_token: string | null; token_expires_at: string | number | null;
+  session_token_hash: string | null; token_expires_at: string | number | null;
   refresh_tokens: RefreshTokenRecord[]; saved_builds: unknown[];
 };
 
@@ -73,7 +73,7 @@ function mapUser(row: UserRow): StoredUser {
     ...(row.last_active_at ? { lastActiveAt: new Date(row.last_active_at).toISOString() } : {}),
     isVerified: row.is_verified,
     avatarSeed: row.avatar_seed,
-    ...(row.session_token ? { token: row.session_token } : {}),
+
     ...(row.token_expires_at != null ? { tokenExpiresAt: Number(row.token_expires_at) } : {}),
     refreshTokens: Array.isArray(row.refresh_tokens) ? row.refresh_tokens : [],
     savedBuilds: Array.isArray(row.saved_builds) ? row.saved_builds : [],
@@ -81,7 +81,7 @@ function mapUser(row: UserRow): StoredUser {
 }
 
 const USER_COLUMNS = `user_id,email,name,password_hash,salt,hash_iterations,created_at,last_active_at,
-  is_verified,avatar_seed,session_token,token_expires_at,refresh_tokens,saved_builds`;
+  is_verified,avatar_seed,session_token_hash,token_expires_at,refresh_tokens,saved_builds`;
 
 export async function getUserByEmail(email: string): Promise<StoredUser | null> {
   const result = await pool.query<UserRow>(
@@ -92,8 +92,8 @@ export async function getUserByEmail(email: string): Promise<StoredUser | null> 
 
 export async function getUserBySessionToken(token: string): Promise<StoredUser | null> {
   const result = await pool.query<UserRow>(
-    `select ${USER_COLUMNS} from app_private.users where session_token = $1 and (token_expires_at is null or token_expires_at > $2) limit 1`,
-    [token, Date.now()]
+    `select ${USER_COLUMNS} from app_private.users where session_token_hash = $1 and token_expires_at > $2 limit 1`,
+    [crypto.createHash('sha256').update(token).digest('hex'), Date.now()]
   );
   return result.rows[0] ? mapUser(result.rows[0]) : null;
 }
@@ -102,16 +102,16 @@ export async function saveUser(user: StoredUser): Promise<void> {
   await pool.query(
     `insert into app_private.users
       (email,user_id,name,password_hash,salt,hash_iterations,created_at,last_active_at,is_verified,
-       avatar_seed,session_token,token_expires_at,refresh_tokens,saved_builds,updated_at)
+       avatar_seed,session_token_hash,token_expires_at,refresh_tokens,saved_builds,updated_at)
      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::jsonb,now())
      on conflict (email) do update set
        user_id=excluded.user_id,name=excluded.name,password_hash=excluded.password_hash,
        salt=excluded.salt,hash_iterations=excluded.hash_iterations,last_active_at=excluded.last_active_at,
-       is_verified=excluded.is_verified,avatar_seed=excluded.avatar_seed,session_token=excluded.session_token,
+       is_verified=excluded.is_verified,avatar_seed=excluded.avatar_seed,session_token_hash=excluded.session_token_hash,
        token_expires_at=excluded.token_expires_at,refresh_tokens=excluded.refresh_tokens,
        saved_builds=excluded.saved_builds,updated_at=now()`,
     [user.email.toLowerCase(),user.id,user.name,user.passwordHash,user.salt ?? null,user.hashIterations ?? null,
-     user.createdAt,user.lastActiveAt ?? null,user.isVerified,user.avatarSeed,user.token ?? null,
+     user.createdAt,user.lastActiveAt ?? null,user.isVerified,user.avatarSeed,user.token ? crypto.createHash('sha256').update(user.token).digest('hex') : null,
      user.tokenExpiresAt ?? null,JSON.stringify(user.refreshTokens ?? []),JSON.stringify(user.savedBuilds ?? [])]
   );
 }
@@ -180,13 +180,13 @@ export async function createVerifiedUserFromCode(email: string, expectedCode: st
     }
     await client.query(
       `insert into app_private.users
-       (email,user_id,name,password_hash,created_at,last_active_at,is_verified,avatar_seed,session_token,
+       (email,user_id,name,password_hash,created_at,last_active_at,is_verified,avatar_seed,session_token_hash,
         token_expires_at,refresh_tokens,saved_builds,updated_at)
        select $1,$2,$3,$4,$5,$6,true,$7,$8,$9,$10::jsonb,'[]'::jsonb,now()
        where not exists(select 1 from app_private.users where email=$1)
        on conflict(email) do nothing`,
       [user.email.toLowerCase(),user.id,user.name,user.passwordHash,user.createdAt,user.lastActiveAt,
-       user.avatarSeed,user.token ?? null,user.tokenExpiresAt ?? null,JSON.stringify(user.refreshTokens ?? [])]
+       user.avatarSeed,user.token ? crypto.createHash('sha256').update(user.token).digest('hex') : null,user.tokenExpiresAt ?? null,JSON.stringify(user.refreshTokens ?? [])]
     );
     const inserted = await client.query('select 1 from app_private.users where email=$1',[email.toLowerCase()]);
     if (!inserted.rowCount) {
@@ -220,9 +220,9 @@ export async function updateSavedBuilds(email: string, builds: unknown[]): Promi
   );
 }
 
-export async function revokeSession(email: string): Promise<void> {
+export async function touchUserSession(email: string): Promise<void> {\n  await pool.query('update app_private.users set last_active_at=now(),updated_at=now() where email=$1',[email.toLowerCase()]);\n}\n\nexport async function revokeSession(email: string): Promise<void> {
   await pool.query(
-    'update app_private.users set session_token=null,token_expires_at=null,updated_at=now() where email=$1',
+    'update app_private.users set session_token_hash=null,token_expires_at=null,updated_at=now() where email=$1',
     [email.toLowerCase()]
   );
 }
@@ -231,10 +231,10 @@ export async function revokeSession(email: string): Promise<void> {
 export async function updateUserSession(user: StoredUser): Promise<void> {
   await pool.query(
     `update app_private.users set password_hash=$2,salt=$3,hash_iterations=$4,
-      last_active_at=$5,session_token=$6,token_expires_at=$7,refresh_tokens=$8::jsonb,updated_at=now()
+      last_active_at=$5,session_token_hash=coalesce($6,session_token_hash),token_expires_at=$7,refresh_tokens=$8::jsonb,updated_at=now()
      where email=$1`,
     [user.email.toLowerCase(),user.passwordHash,user.salt ?? null,user.hashIterations ?? null,
-     user.lastActiveAt ?? null,user.token ?? null,user.tokenExpiresAt ?? null,
+     user.lastActiveAt ?? null,user.token ? crypto.createHash('sha256').update(user.token).digest('hex') : null,user.tokenExpiresAt ?? null,
      JSON.stringify(user.refreshTokens ?? [])]
   );
 }
@@ -260,9 +260,9 @@ export async function rotateRefreshToken(oldHash: string, newRecord: RefreshToke
     user.tokenExpiresAt = accessExpiresAt;
     user.lastActiveAt = new Date().toISOString();
     await client.query(
-      `update app_private.users set session_token=$2,token_expires_at=$3,
+      `update app_private.users set session_token_hash=$2,token_expires_at=$3,
        last_active_at=$4,refresh_tokens=$5::jsonb,updated_at=now() where email=$1`,
-      [user.email,newAccessToken,accessExpiresAt,user.lastActiveAt,JSON.stringify(user.refreshTokens)]
+      [user.email,crypto.createHash('sha256').update(newAccessToken).digest('hex'),accessExpiresAt,user.lastActiveAt,JSON.stringify(user.refreshTokens)]
     );
     await client.query('commit');
     return user;
