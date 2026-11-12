@@ -14,6 +14,7 @@ interface SlidingRateRecord {
   timestamps: number[];
   failedAttempts: number;
   blockedUntil: number;
+  lastSeen: number;
 }
 
 const rateLimitStore = new Map<string, SlidingRateRecord>();
@@ -23,7 +24,7 @@ setInterval(() => {
   const now = Date.now();
   for (const [key, record] of rateLimitStore.entries()) {
     record.timestamps = record.timestamps.filter((ts) => now - ts < 600000); // 10 min window
-    if (record.timestamps.length === 0 && now > record.blockedUntil && record.failedAttempts === 0) {
+    if (now - record.lastSeen > 30 * 60 * 1000) {
       rateLimitStore.delete(key);
     }
   }
@@ -53,9 +54,15 @@ export function checkMultiTierRateLimit(
   let record = rateLimitStore.get(key);
 
   if (!record) {
-    record = { timestamps: [], failedAttempts: 0, blockedUntil: 0 };
+    // Bound memory use when attackers submit many unique account identifiers.
+    if (rateLimitStore.size >= 50000) {
+      const oldestKey = rateLimitStore.keys().next().value;
+      if (oldestKey) rateLimitStore.delete(oldestKey);
+    }
+    record = { timestamps: [], failedAttempts: 0, blockedUntil: 0, lastSeen: now };
     rateLimitStore.set(key, record);
   }
+  record.lastSeen = now;
 
   // Check if currently blocked
   if (now < record.blockedUntil) {
@@ -106,6 +113,7 @@ export function checkMultiTierRateLimit(
 export function recordFailedAuthAttempt(accountKey: string, ip: string): void {
   const record = rateLimitStore.get(accountKey);
   if (record) {
+    record.lastSeen = Date.now();
     record.failedAttempts += 1;
     if (record.failedAttempts >= 3) {
       const backoffMs = Math.min(300000, 5000 * Math.pow(2, Math.min(record.failedAttempts - 2, 6)));
@@ -127,6 +135,7 @@ export function recordFailedAuthAttempt(accountKey: string, ip: string): void {
 export function resetAuthAttempts(accountKey: string): void {
   const record = rateLimitStore.get(accountKey);
   if (record) {
+    record.lastSeen = Date.now();
     record.failedAttempts = 0;
     record.blockedUntil = 0;
   }
