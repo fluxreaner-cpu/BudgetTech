@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { Pool, PoolClient } from 'pg';
 import crypto from 'crypto';
+import { hashVerificationCode } from '../security/cryptoEngine';
 
 export interface RefreshTokenRecord {
   tokenHash: string;
@@ -30,7 +31,7 @@ export interface StoredCode {
   email: string;
   name: string;
   passwordHash: string;
-  code: string;
+  code?: string;
   expiresAt: number;
   attemptsLeft: number;
 }
@@ -117,24 +118,27 @@ export async function saveUser(user: StoredUser): Promise<void> {
 }
 
 export async function saveVerificationCode(code: StoredCode): Promise<void> {
+  if (!code.code || !/^\d{6}$/.test(code.code)) {
+    throw new Error('Verification code must be a six-digit string.');
+  }
   await pool.query(
-    `insert into app_private.verification_codes(email,name,password_hash,code,expires_at,attempts_left,created_at)
+    `insert into app_private.verification_codes(email,name,password_hash,code_hash,expires_at,attempts_left,created_at)
      values($1,$2,$3,$4,$5,$6,now())
      on conflict(email) do update set name=excluded.name,password_hash=excluded.password_hash,
-       code=excluded.code,expires_at=excluded.expires_at,attempts_left=excluded.attempts_left,created_at=now()`,
-    [code.email.toLowerCase(),code.name,code.passwordHash,code.code,code.expiresAt,code.attemptsLeft]
+       code_hash=excluded.code_hash,expires_at=excluded.expires_at,attempts_left=excluded.attempts_left,created_at=now()`,
+    [code.email.toLowerCase(),code.name,code.passwordHash,hashVerificationCode(code.email,code.code),code.expiresAt,code.attemptsLeft]
   );
 }
 
 export async function getVerificationCode(email: string): Promise<StoredCode | null> {
   const result = await pool.query(
-    `select email,name,password_hash,code,expires_at,attempts_left
+    `select email,name,password_hash,expires_at,attempts_left
      from app_private.verification_codes where email=$1 and expires_at>$2 limit 1`,
     [email.toLowerCase(),Date.now()]
   );
   const row = result.rows[0];
   return row ? { email: row.email, name: row.name, passwordHash: row.password_hash,
-    code: row.code, expiresAt: Number(row.expires_at), attemptsLeft: row.attempts_left } : null;
+    expiresAt: Number(row.expires_at), attemptsLeft: row.attempts_left } : null;
 }
 
 export async function decrementCodeAttempts(email: string): Promise<number | null> {
@@ -157,7 +161,7 @@ export async function createVerifiedUserFromCode(email: string, expectedCode: st
   try {
     await client.query('begin');
     const codeResult = await client.query(
-      `select code,expires_at,attempts_left from app_private.verification_codes
+      `select code_hash,expires_at,attempts_left from app_private.verification_codes
        where email=$1 for update`, [email.toLowerCase()]
     );
     const code = codeResult.rows[0];
@@ -165,8 +169,8 @@ export async function createVerifiedUserFromCode(email: string, expectedCode: st
       await client.query('rollback');
       return false;
     }
-    const supplied = Buffer.from(String(expectedCode));
-    const actual = Buffer.from(String(code.code));
+    const supplied = Buffer.from(hashVerificationCode(email, expectedCode), 'hex');
+    const actual = Buffer.from(String(code.code_hash), 'hex');
     const valid = supplied.length === actual.length && crypto.timingSafeEqual(supplied, actual);
     if (!valid) {
       const remaining = Number(code.attempts_left) - 1;
