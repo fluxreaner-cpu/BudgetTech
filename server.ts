@@ -586,8 +586,7 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
       });
     }
 
-    const users = loadUsers();
-    const user = users[cleanEmail];
+    const user = await getUserByEmail(cleanEmail);
 
     // User Enumeration Defense (Level 4):
     // If user does not exist, run dummy Argon2id calculation and return identical generic error!
@@ -660,7 +659,7 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
       },
     ];
 
-    saveUsers(users);
+    await updateUserSession(user as DbStoredUser);
 
     // Set HttpOnly, Secure, SameSite=Strict cookies (Level 2)
     setAuthCookies(res, token, refreshToken);
@@ -688,91 +687,43 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
  * 4. Refresh Token Rotation (RTR) Endpoint (Level 5)
  * Detects token replay attacks: if an already-rotated token is reused, revokes all sessions!
  */
-app.post('/api/auth/refresh', (req: Request, res: Response) => {
+app.post('/api/auth/refresh', async (req: Request, res: Response) => {
   try {
     const clientIp = getClientIp(req);
-    const incomingRefreshToken = req.cookies?.budgettech_refresh || req.body?.refreshToken;
-
-    if (!incomingRefreshToken || typeof incomingRefreshToken !== 'string') {
+    const incoming = req.cookies?.budgettech_refresh || req.body?.refreshToken;
+    if (!incoming || typeof incoming !== 'string') {
       clearAuthCookies(res);
       return res.status(401).json({ error: 'Токен обновления отсутствует' });
     }
-
-    const incomingHash = crypto.createHash('sha256').update(incomingRefreshToken).digest('hex');
-    const users = loadUsers();
-
-    // Find user containing this token
-    let foundUser: StoredUser | null = null;
-    let matchedTokenIndex = -1;
-
-    for (const u of Object.values(users)) {
-      if (u.refreshTokens) {
-        const idx = u.refreshTokens.findIndex((t) => t.tokenHash === incomingHash);
-        if (idx !== -1) {
-          foundUser = u;
-          matchedTokenIndex = idx;
-          break;
-        }
-      }
-    }
-
-    if (!foundUser || matchedTokenIndex === -1) {
-      // Token not found: Possible token theft / replay of old token
-      logSecurityEvent({
-        eventType: 'AUTH_TOKEN_REPLAY_DETECTED',
-        severity: 'CRITICAL',
-        ip: clientIp,
-        details: { note: 'Invalid or already reused refresh token presented' },
-      });
+    const oldHash = crypto.createHash('sha256').update(incoming).digest('hex');
+    const candidate = await findUserByRefreshHash(oldHash);
+    if (!candidate) {
+      logSecurityEvent({ eventType: 'AUTH_TOKEN_REPLAY_DETECTED', severity: 'CRITICAL', ip: clientIp,
+        details: { note: 'Invalid or already reused refresh token presented' } });
       clearAuthCookies(res);
       return res.status(401).json({ error: 'Недействительный токен сессии. Выполните вход заново.' });
     }
-
-    const matchedRecord = foundUser.refreshTokens![matchedTokenIndex];
-
-    // Check expiration
-    if (Date.now() > matchedRecord.expiresAt) {
-      foundUser.refreshTokens!.splice(matchedTokenIndex, 1);
-      saveUsers(users);
+    const oldRecord = candidate.refreshTokens.find(t => t.tokenHash === oldHash);
+    if (!oldRecord || oldRecord.expiresAt <= Date.now()) {
       clearAuthCookies(res);
       return res.status(401).json({ error: 'Срок действия сессии истек' });
     }
-
-    // Rotate tokens (RTR)
-    const newAccessToken = crypto.randomBytes(32).toString('hex');
-    const newRefreshToken = crypto.randomBytes(48).toString('hex');
-    const newRefreshHash = crypto.createHash('sha256').update(newRefreshToken).digest('hex');
-
-    foundUser.token = newAccessToken;
-    foundUser.tokenExpiresAt = Date.now() + 30 * 24 * 60 * 60 * 1000;
-    foundUser.lastActiveAt = new Date().toISOString();
-
-    // Replace the rotated token with the next generation
-    foundUser.refreshTokens![matchedTokenIndex] = {
-      tokenHash: newRefreshHash,
-      familyId: matchedRecord.familyId,
-      generation: matchedRecord.generation + 1,
+    const newAccess = crypto.randomBytes(32).toString('hex');
+    const newRefresh = crypto.randomBytes(48).toString('hex');
+    const rotated = await rotateRefreshToken(oldHash, {
+      tokenHash: crypto.createHash('sha256').update(newRefresh).digest('hex'),
+      familyId: oldRecord.familyId, generation: oldRecord.generation + 1,
       expiresAt: Date.now() + 90 * 24 * 60 * 60 * 1000,
-    };
-
-    saveUsers(users);
-
-    setAuthCookies(res, newAccessToken, newRefreshToken);
-
-    logSecurityEvent({
-      eventType: 'AUTH_TOKEN_ROTATED',
-      severity: 'INFO',
-      ip: clientIp,
-      identifier: foundUser.email,
-      details: { familyId: matchedRecord.familyId, generation: matchedRecord.generation + 1 },
-    });
-
-    return res.json({
-      success: true,
-      token: newAccessToken,
-      user: sanitizeUserResponse(foundUser),
-    });
-  } catch (error: any) {
+    }, newAccess, Date.now() + 30 * 24 * 60 * 60 * 1000);
+    if (!rotated) {
+      clearAuthCookies(res);
+      return res.status(401).json({ error: 'Сессия уже обновлена или истекла. Выполните вход заново.' });
+    }
+    setAuthCookies(res, newAccess, newRefresh);
+    logSecurityEvent({ eventType: 'AUTH_TOKEN_ROTATED', severity: 'INFO', ip: clientIp,
+      identifier: rotated.email, details: { familyId: oldRecord.familyId, generation: oldRecord.generation + 1 } });
+    return res.json({ success: true, token: newAccess, user: sanitizeUserResponse(rotated) });
+  } catch (error) {
     console.error('Error in /api/auth/refresh:', error);
     return res.status(500).json({ error: 'Ошибка обновления токена' });
   }
