@@ -6,6 +6,13 @@ import dotenv from 'dotenv';
 import nodemailer, { Transporter } from 'nodemailer';
 import crypto from 'crypto';
 import cookieParser from 'cookie-parser';
+import {
+  getUserByEmail, getUserBySessionToken, saveUser, saveVerificationCode,
+  getVerificationCode, decrementCodeAttempts, deleteVerificationCode,
+  createVerifiedUserFromCode, updateUserSession, findUserByRefreshHash,
+  rotateRefreshToken, updateSavedBuilds, revokeSession, type StoredUser as DbStoredUser
+} from './server/storage/postgresStore';
+
 
 // AppSec Modules
 import { logSecurityEvent } from './server/security/auditLogger';
@@ -46,7 +53,8 @@ dotenv.config();
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const isProd = process.env.NODE_ENV === 'production';
-const SESSION_SECRET = process.env.SESSION_SECRET || 'budgettech_appsec_session_secret_7721';
+const SESSION_SECRET = process.env.SESSION_SECRET;
+if (isProd && !SESSION_SECRET) throw new Error('SESSION_SECRET must be configured in production.');
 
 // Level 22: Trust Proxy for accurate Cloudflare / GCP Cloud Run IP extraction
 app.set('trust proxy', 1);
@@ -64,7 +72,7 @@ app.use(browserSecurityHeaders);
 app.use(corsValidator);
 
 // Level 2: Cookie Parser with signed session cookie support
-app.use(cookieParser(SESSION_SECRET));
+app.use(cookieParser(SESSION_SECRET || 'local-development-only-change-me'));
 
 // Level 29: Restrict request payload size to 64kb to prevent memory exhaustion DoS
 app.use(express.json({ limit: '64kb' }));
@@ -432,8 +440,7 @@ app.post('/api/auth/send-code', async (req: Request, res: Response) => {
       });
     }
 
-    const users = loadUsers();
-    const existing = users[cleanEmail];
+    const existing = await getUserByEmail(cleanEmail);
 
     // User Enumeration Defense (Level 4):
     // If user already exists and verified, don't leak "user already exists".
@@ -462,16 +469,7 @@ app.post('/api/auth/send-code', async (req: Request, res: Response) => {
     const passwordHash = await hashPasswordArgon2(password);
     const expiresAt = Date.now() + 5 * 60 * 1000; // Strictly 5 min TTL (Level 7)
 
-    const codes = loadCodes();
-    codes[cleanEmail] = {
-      email: cleanEmail,
-      name: cleanName,
-      passwordHash,
-      code,
-      expiresAt,
-      attemptsLeft: 3, // Strictly 3 attempts (Level 7)
-    };
-    saveCodes(codes);
+    await saveVerificationCode({ email: cleanEmail, name: cleanName, passwordHash, code, expiresAt, attemptsLeft: 3 });
 
     logSecurityEvent({
       eventType: 'AUTH_OTP_REQUEST',
@@ -487,7 +485,7 @@ app.post('/api/auth/send-code', async (req: Request, res: Response) => {
       success: true,
       message: `Код подтверждения отправлен на почту ${cleanEmail}`,
       isSmtpSent,
-      debugCode: code, // For instant testing in sandbox
+      ...(isProd ? {} : { debugCode: code }), // Never expose OTP in production
       expiresAt,
     });
   } catch (error: any) {
@@ -502,117 +500,47 @@ app.post('/api/auth/send-code', async (req: Request, res: Response) => {
  * - Timing-safe OTP verification
  * - Issues HttpOnly, Secure, SameSite=Strict cookies + Refresh Token Rotation
  */
-app.post('/api/auth/verify-code', (req: Request, res: Response) => {
+app.post('/api/auth/verify-code', async (req: Request, res: Response) => {
   try {
     const clientIp = getClientIp(req);
-
-    // Zod validation (Level 13)
-    const parseResult = VerifyCodeSchema.safeParse(req.body);
-    if (!parseResult.success) {
-      return res.status(400).json({ error: parseResult.error.issues[0]?.message || 'Некорректный код' });
-    }
-
-    const { email: cleanEmail, code: cleanCode } = parseResult.data;
-
-    const codes = loadCodes();
-    const stored = codes[cleanEmail];
-
-    if (!stored) {
-      return res.status(400).json({ error: 'Код подтверждения не найден или истек срок его действия. Запросите новый код.' });
-    }
-
+    const parsed = VerifyCodeSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Некорректный код' });
+    const { email: cleanEmail, code: cleanCode } = parsed.data;
+    const stored = await getVerificationCode(cleanEmail);
+    if (!stored) return res.status(400).json({ error: 'Код подтверждения не найден или истек срок его действия. Запросите новый код.' });
     if (Date.now() > stored.expiresAt) {
-      delete codes[cleanEmail];
-      saveCodes(codes);
+      await deleteVerificationCode(cleanEmail);
       return res.status(400).json({ error: 'Срок действия кода истек (TTL 5 мин). Запросите новый код.' });
     }
-
-    // Check attempts left (Level 7)
-    if (stored.attemptsLeft <= 1 && !timingSafeCompare(cleanCode, stored.code)) {
-      delete codes[cleanEmail];
-      saveCodes(codes);
-      logSecurityEvent({
-        eventType: 'AUTH_OTP_EXHAUSTED',
-        severity: 'WARN',
-        ip: clientIp,
-        identifier: cleanEmail,
-        details: { note: 'All 3 attempts failed. Code revoked.' },
-      });
-      return res.status(429).json({ error: 'Превышен лимит в 3 попытки ввода. Код аннулирован. Запросите новый.' });
-    }
-
-    // Timing-safe comparison (Level 7)
-    if (!timingSafeCompare(cleanCode, stored.code)) {
-      stored.attemptsLeft -= 1;
-      saveCodes(codes);
-      logSecurityEvent({
-        eventType: 'AUTH_OTP_FAILURE',
-        severity: 'WARN',
-        ip: clientIp,
-        identifier: cleanEmail,
-        details: { attemptsLeft: stored.attemptsLeft },
-      });
-      return res.status(400).json({
-        error: `Неверный код подтверждения. Осталось попыток: ${stored.attemptsLeft}`,
-      });
-    }
-
-    // Code is valid! Create persistent user profile
-    const users = loadUsers();
     const token = crypto.randomBytes(32).toString('hex');
     const refreshToken = crypto.randomBytes(48).toString('hex');
-    const tokenExpiresAt = Date.now() + 30 * 24 * 60 * 60 * 1000; // 30 days
-
-    // Hash refresh token for storage
-    const refreshHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
-    const familyId = crypto.randomUUID();
-
+    const now = Date.now();
     const newUser: StoredUser = {
-      id: `usr_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
-      email: cleanEmail,
-      name: stored.name,
-      passwordHash: stored.passwordHash,
-      createdAt: new Date().toISOString(),
-      lastActiveAt: new Date().toISOString(),
-      isVerified: true,
-      avatarSeed: cleanEmail,
-      token,
-      tokenExpiresAt,
-      refreshTokens: [
-        {
-          tokenHash: refreshHash,
-          familyId,
-          generation: 1,
-          expiresAt: Date.now() + 90 * 24 * 60 * 60 * 1000,
-        },
-      ],
+      id: `usr_${now}_${crypto.randomBytes(4).toString('hex')}`,
+      email: cleanEmail, name: stored.name, passwordHash: stored.passwordHash,
+      createdAt: new Date(now).toISOString(), lastActiveAt: new Date(now).toISOString(),
+      isVerified: true, avatarSeed: cleanEmail, token, tokenExpiresAt: now + 30 * 24 * 60 * 60 * 1000,
+      refreshTokens: [{ tokenHash: crypto.createHash('sha256').update(refreshToken).digest('hex'),
+        familyId: crypto.randomUUID(), generation: 1, expiresAt: now + 90 * 24 * 60 * 60 * 1000 }],
       savedBuilds: [],
     };
-
-    users[cleanEmail] = newUser;
-    saveUsers(users);
-
-    delete codes[cleanEmail];
-    saveCodes(codes);
-
-    // Set HttpOnly, Secure, SameSite=Strict cookies (Level 2)
+    const created = await createVerifiedUserFromCode(cleanEmail, cleanCode, newUser as DbStoredUser);
+    if (!created) {
+      const remaining = await decrementCodeAttempts(cleanEmail);
+      if (remaining === null) return res.status(400).json({ error: 'Код подтверждения недействителен или истёк.' });
+      logSecurityEvent({ eventType: remaining === 0 ? 'AUTH_OTP_EXHAUSTED' : 'AUTH_OTP_FAILURE',
+        severity: 'WARN', ip: clientIp, identifier: cleanEmail, details: { attemptsLeft: remaining } });
+      return res.status(remaining === 0 ? 429 : 400).json({
+        error: remaining === 0 ? 'Превышен лимит в 3 попытки ввода. Код аннулирован. Запросите новый.' :
+          `Неверный код подтверждения. Осталось попыток: ${remaining}`
+      });
+    }
     setAuthCookies(res, token, refreshToken);
-
-    logSecurityEvent({
-      eventType: 'AUTH_REGISTER_CONFIRMED',
-      severity: 'INFO',
-      ip: clientIp,
-      identifier: cleanEmail,
-      details: { userId: newUser.id },
-    });
-
-    return res.json({
-      success: true,
-      message: 'Регистрация успешно подтверждена!',
-      user: sanitizeUserResponse(newUser),
-      token,
-    });
-  } catch (error: any) {
+    logSecurityEvent({ eventType: 'AUTH_REGISTER_CONFIRMED', severity: 'INFO', ip: clientIp,
+      identifier: cleanEmail, details: { userId: newUser.id } });
+    return res.json({ success: true, message: 'Регистрация успешно подтверждена!',
+      user: sanitizeUserResponse(newUser), token });
+  } catch (error) {
     console.error('Error in /api/auth/verify-code:', error);
     return res.status(500).json({ error: 'Ошибка при проверке кода' });
   }
