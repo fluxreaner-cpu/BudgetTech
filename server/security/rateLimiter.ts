@@ -1,27 +1,13 @@
 import { Request } from 'express';
 import { logSecurityEvent } from './auditLogger';
 
+/**
+ * Express resolves req.ip using the configured trust-proxy chain.
+ * Do not read X-Forwarded-For / Cloudflare headers directly: clients can
+ * forge those headers unless the immediate proxy is explicitly trusted.
+ */
 export function getClientIp(req: Request): string {
-  // 1. Cloudflare True-Client-IP / CF-Connecting-IP
-  const cfIp = req.headers['cf-connecting-ip'] || req.headers['true-client-ip'];
-  if (typeof cfIp === 'string' && cfIp.trim()) {
-    return cfIp.trim().split(',')[0].trim();
-  }
-
-  // 2. Standard X-Forwarded-For (first entry is the client IP)
-  const forwarded = req.headers['x-forwarded-for'];
-  if (typeof forwarded === 'string' && forwarded.trim()) {
-    return forwarded.split(',')[0].trim();
-  }
-
-  // 3. Nginx X-Real-IP
-  const realIp = req.headers['x-real-ip'];
-  if (typeof realIp === 'string' && realIp.trim()) {
-    return realIp.trim();
-  }
-
-  // 4. Socket remote address
-  return req.socket?.remoteAddress || req.ip || '127.0.0.1';
+  return req.ip || req.socket?.remoteAddress || '127.0.0.1';
 }
 
 interface SlidingRateRecord {
