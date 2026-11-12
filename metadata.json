@@ -1,0 +1,8 @@
+{
+  "name": "Remix BudgetTech Cyber Aggregator",
+  "description": "A futuristic multi-language marketplace for budget hardware, featuring a secure login, interactive catalog, and immersive 3D-styled UI.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
