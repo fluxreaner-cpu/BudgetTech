@@ -10,7 +10,7 @@ import {
   getUserByEmail, getUserBySessionToken, saveVerificationCode,
   getVerificationCode, decrementCodeAttempts, deleteVerificationCode,
   createVerifiedUserFromCode, updateUserSession, findUserByRefreshHash,
-  rotateRefreshToken, updateSavedBuilds, revokeSession, touchUserSession, type StoredUser as DbStoredUser
+  rotateRefreshToken, updateSavedBuilds, revokeSession, touchUserSession, pool, type StoredUser as DbStoredUser
 } from './server/storage/postgresStore';
 
 
@@ -78,6 +78,17 @@ app.use(express.urlencoded({ extended: false, limit: '64kb' }));
 
 // Level 21: Anti-CSRF Guard for mutating requests
 app.use(csrfProtection);
+
+// Readiness endpoint: verifies both the HTTP process and PostgreSQL connectivity.
+app.get('/health', async (_req: Request, res: Response) => {
+  try {
+    await pool.query('select 1');
+    return res.status(200).json({ status: 'ok', database: 'connected' });
+  } catch (error) {
+    console.error('[Health Check] PostgreSQL unavailable:', error instanceof Error ? error.message : 'unknown error');
+    return res.status(503).json({ status: 'unavailable', database: 'disconnected' });
+  }
+});
 
 // --- End-to-End Cryptography: RSA-2048 Keypair & Wire Decryption Middleware ---
 const DATA_DIR = path.resolve(process.cwd(), 'data');
