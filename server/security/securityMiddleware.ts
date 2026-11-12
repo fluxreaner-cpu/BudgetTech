@@ -29,7 +29,7 @@ function getAllowedOrigins(): Set<string> {
     try {
       const parsed = new URL(candidate);
       if ((parsed.protocol === 'https:' || parsed.protocol === 'http:') &&
-          parsed.origin === candidate.replace(/\\/$/, '')) {
+          parsed.origin === (candidate.endsWith('/') ? candidate.slice(0, -1) : candidate)) {
         allowed.add(parsed.origin);
       }
     } catch {
