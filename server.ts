@@ -130,7 +130,7 @@ function initializeCryptoKeys(): ServerKeyPair {
     privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
   });
   fs.writeFileSync(PRIVATE_KEY_FILE, privateKey, { mode: 0o600, flag: 'wx' });
-  fs.writeFileSync(PUBLIC_KEY_FILE, publicKey, { mode: '0o644' as any });
+  fs.writeFileSync(PUBLIC_KEY_FILE, publicKey, { mode: 0o644 });
   const keyId = crypto.createHash('sha256').update(publicKey).digest('hex').slice(0, 16);
   return { publicKeyPem: publicKey, privateKeyPem: privateKey, keyId };
 }
