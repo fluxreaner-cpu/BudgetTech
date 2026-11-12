@@ -154,3 +154,14 @@ export function timingSafeCompare(a: string, b: string): boolean {
     return false;
   }
 }
+
+
+/** Keyed OTP digest; the database alone cannot enumerate the six-digit code space. */
+export function hashVerificationCode(email: string, code: string): string {
+  return crypto.createHmac('sha256', masterKey)
+    .update('budgettech:email-verification:v1\0', 'utf8')
+    .update(email.trim().toLowerCase(), 'utf8')
+    .update('\0', 'utf8')
+    .update(code, 'utf8')
+    .digest('hex');
+}
