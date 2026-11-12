@@ -526,8 +526,9 @@ app.post('/api/auth/verify-code', async (req: Request, res: Response) => {
     };
     const created = await createVerifiedUserFromCode(cleanEmail, cleanCode, newUser as DbStoredUser);
     if (!created) {
-      const remaining = await decrementCodeAttempts(cleanEmail);
-      if (remaining === null) return res.status(400).json({ error: 'Код подтверждения недействителен или истёк.' });
+      const latestCode = await getVerificationCode(cleanEmail);
+      const remaining = latestCode?.attemptsLeft ?? 0;
+      if (!latestCode) return res.status(400).json({ error: 'Код подтверждения недействителен или истёк.' });
       logSecurityEvent({ eventType: remaining === 0 ? 'AUTH_OTP_EXHAUSTED' : 'AUTH_OTP_FAILURE',
         severity: 'WARN', ip: clientIp, identifier: cleanEmail, details: { attemptsLeft: remaining } });
       return res.status(remaining === 0 ? 429 : 400).json({
