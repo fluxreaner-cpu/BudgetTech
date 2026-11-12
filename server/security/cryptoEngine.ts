@@ -12,21 +12,28 @@ if (!fs.existsSync(KEYS_DIR)) {
 }
 
 function getMasterEncryptionKey(): Buffer {
-  if (process.env.DB_ENCRYPTION_KEY && process.env.DB_ENCRYPTION_KEY.length >= 64) {
-    return Buffer.from(process.env.DB_ENCRYPTION_KEY.slice(0, 64), 'hex');
+  const configuredKey = process.env.DB_ENCRYPTION_KEY;
+  if (configuredKey) {
+    if (!/^[0-9a-fA-F]{64}$/.test(configuredKey)) {
+      throw new Error('DB_ENCRYPTION_KEY must be exactly 64 hexadecimal characters.');
+    }
+    return Buffer.from(configuredKey, 'hex');
+  }
+
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('DB_ENCRYPTION_KEY must be configured in production.');
   }
 
   if (fs.existsSync(MASTER_KEY_FILE)) {
-    try {
-      const keyHex = fs.readFileSync(MASTER_KEY_FILE, 'utf-8').trim();
-      return Buffer.from(keyHex, 'hex');
-    } catch (err) {
-      console.warn('[Crypto Engine] Failed reading db_master.key, generating new:', err);
+    const keyHex = fs.readFileSync(MASTER_KEY_FILE, 'utf-8').trim();
+    if (!/^[0-9a-fA-F]{64}$/.test(keyHex)) {
+      throw new Error('Stored development encryption key is invalid.');
     }
+    return Buffer.from(keyHex, 'hex');
   }
 
   const generatedKey = crypto.randomBytes(32);
-  fs.writeFileSync(MASTER_KEY_FILE, generatedKey.toString('hex'), { mode: 0o600 });
+  fs.writeFileSync(MASTER_KEY_FILE, generatedKey.toString('hex'), { mode: 0o600, flag: 'wx' });
   return generatedKey;
 }
 

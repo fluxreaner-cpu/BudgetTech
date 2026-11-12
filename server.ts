@@ -98,6 +98,21 @@ interface ServerKeyPair {
 }
 
 function initializeCryptoKeys(): ServerKeyPair {
+  const configuredPrivateKey = process.env.SERVER_RSA_PRIVATE_KEY?.replace(/\\n/g, '\n');
+  const configuredPublicKey = process.env.SERVER_RSA_PUBLIC_KEY?.replace(/\\n/g, '\n');
+
+  if (configuredPrivateKey) {
+    const privateKeyPem = configuredPrivateKey;
+    const publicKeyPem = configuredPublicKey ||
+      crypto.createPublicKey(privateKeyPem).export({ type: 'spki', format: 'pem' }).toString();
+    const keyId = crypto.createHash('sha256').update(publicKeyPem).digest('hex').slice(0, 16);
+    return { publicKeyPem, privateKeyPem, keyId };
+  }
+
+  if (isProd) {
+    throw new Error('SERVER_RSA_PRIVATE_KEY must be configured in production.');
+  }
+
   try {
     if (fs.existsSync(PRIVATE_KEY_FILE) && fs.existsSync(PUBLIC_KEY_FILE)) {
       const privateKeyPem = fs.readFileSync(PRIVATE_KEY_FILE, 'utf-8');
@@ -106,19 +121,16 @@ function initializeCryptoKeys(): ServerKeyPair {
       return { publicKeyPem, privateKeyPem, keyId };
     }
   } catch (err) {
-    console.warn('[Crypto Engine] Failed reading existing keys, generating fresh:', err);
+    console.warn('[Crypto Engine] Failed reading development keys:', err);
   }
 
-  console.log('[Crypto Engine] Generating 2048-bit RSA-OAEP keypair for end-to-end wire encryption...');
   const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
     modulusLength: 2048,
     publicKeyEncoding: { type: 'spki', format: 'pem' },
     privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
   });
-
-  fs.writeFileSync(PRIVATE_KEY_FILE, privateKey, { mode: 0o600 });
-  fs.writeFileSync(PUBLIC_KEY_FILE, publicKey, { mode: 0o644 });
-
+  fs.writeFileSync(PRIVATE_KEY_FILE, privateKey, { mode: 0o600, flag: 'wx' });
+  fs.writeFileSync(PUBLIC_KEY_FILE, publicKey, { mode: '0o644' as any });
   const keyId = crypto.createHash('sha256').update(publicKey).digest('hex').slice(0, 16);
   return { publicKeyPem: publicKey, privateKeyPem: privateKey, keyId };
 }
