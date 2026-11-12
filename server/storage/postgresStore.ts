@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { Pool, PoolClient } from 'pg';
 import crypto from 'crypto';
 
