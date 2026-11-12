@@ -733,143 +733,85 @@ app.post('/api/auth/refresh', async (req: Request, res: Response) => {
  * 5. Session Validation (/api/auth/me)
  * Supports both HttpOnly cookie and Bearer header for iframe compatibility
  */
-app.get('/api/auth/me', (req: Request, res: Response) => {
+app.get('/api/auth/me', async (req: Request, res: Response) => {
   try {
-    let token = req.cookies?.budgettech_session;
-    if (!token) {
-      const authHeader = req.headers.authorization;
-      if (authHeader && authHeader.startsWith('Bearer ')) {
-        token = authHeader.split(' ')[1];
-      }
-    }
-
-    if (!token) {
-      return res.status(401).json({ error: 'Не авторизован' });
-    }
-
-    const users = loadUsers();
-    const user = Object.values(users).find((u) => u.token === token);
-
+    const token = req.cookies?.budgettech_session ||
+      (req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : undefined);
+    if (!token) return res.status(401).json({ error: 'Не авторизован' });
+    const user = await getUserBySessionToken(token);
     if (!user) {
+      clearAuthCookies(res);
       return res.status(401).json({ error: 'Сессия истекла или недействительна' });
     }
-
-    if (user.tokenExpiresAt && Date.now() > user.tokenExpiresAt) {
-      delete user.token;
-      saveUsers(users);
-      clearAuthCookies(res);
-      return res.status(401).json({ error: 'Срок действия сессии истек. Войдите заново.' });
-    }
-
     user.lastActiveAt = new Date().toISOString();
-    saveUsers(users);
-
+    await updateUserSession(user as DbStoredUser);
     return res.json({ success: true, user: sanitizeUserResponse(user) });
-  } catch (error: any) {
+  } catch (error) {
     console.error('Error in /api/auth/me:', error);
     return res.status(500).json({ error: 'Ошибка проверки сессии' });
   }
 });
 
-/**
- * 6. Logout: Revokes tokens and clears HttpOnly cookies
- */
-app.post('/api/auth/logout', (req: Request, res: Response) => {
+app.post('/api/auth/logout', async (req: Request, res: Response) => {
   try {
-    let token = req.cookies?.budgettech_session;
-    if (!token) {
-      const authHeader = req.headers.authorization;
-      if (authHeader && authHeader.startsWith('Bearer ')) {
-        token = authHeader.split(' ')[1];
-      }
-    }
-
+    const token = req.cookies?.budgettech_session ||
+      (req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : undefined);
     if (token) {
-      const users = loadUsers();
-      const user = Object.values(users).find((u) => u.token === token);
+      const user = await getUserBySessionToken(token);
       if (user) {
-        delete user.token;
-        delete user.tokenExpiresAt;
-        saveUsers(users);
-        logSecurityEvent({
-          eventType: 'AUTH_LOGOUT',
-          severity: 'INFO',
-          ip: getClientIp(req),
-          identifier: user.email,
-          details: { userId: user.id },
-        });
+        await revokeSession(user.email);
+        logSecurityEvent({ eventType: 'AUTH_LOGOUT', severity: 'INFO', ip: getClientIp(req),
+          identifier: user.email, details: { userId: user.id } });
       }
     }
-
     clearAuthCookies(res);
     return res.json({ success: true, message: 'Сессия успешно завершена' });
-  } catch (error: any) {
+  } catch (error) {
+    console.error('Error in /api/auth/logout:', error);
     return res.status(500).json({ error: 'Ошибка при выходе' });
   }
 });
 
-/**
- * 7. Anti-IDOR Protected Saved Builds & Rig Storage (Level 25)
- * Strict object ownership check ensures user can only read/write their own builds
- */
-function getAuthenticatedUser(req: Request): StoredUser | null {
-  let token = req.cookies?.budgettech_session;
-  if (!token) {
-    const authHeader = req.headers.authorization;
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      token = authHeader.split(' ')[1];
-    }
-  }
+async function getAuthenticatedUser(req: Request): Promise<DbStoredUser | null> {
+  const token = req.cookies?.budgettech_session ||
+    (req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : undefined);
   if (!token) return null;
-  const users = loadUsers();
-  const user = Object.values(users).find((u) => u.token === token);
-  if (!user) return null;
-  if (user.tokenExpiresAt && Date.now() > user.tokenExpiresAt) return null;
-  return user;
+  return getUserBySessionToken(token);
 }
 
-app.get('/api/user/saved-rigs', (req: Request, res: Response) => {
-  const user = getAuthenticatedUser(req);
-  if (!user) {
-    logSecurityEvent({
-      eventType: 'IDOR_ACCESS_DENIED',
-      severity: 'WARN',
-      ip: getClientIp(req),
-      details: { path: req.path },
-    });
-    return res.status(401).json({ error: 'Требуется авторизация' });
+app.get('/api/user/saved-rigs', async (req: Request, res: Response) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+    if (!user) {
+      logSecurityEvent({ eventType: 'IDOR_ACCESS_DENIED', severity: 'WARN', ip: getClientIp(req),
+        details: { path: req.path } });
+      return res.status(401).json({ error: 'Требуется авторизация' });
+    }
+    return res.json({ success: true, savedBuilds: user.savedBuilds || [], userId: user.id });
+  } catch (error) {
+    console.error('Error loading saved rigs:', error);
+    return res.status(500).json({ error: 'Ошибка загрузки сборок' });
   }
-
-  return res.json({
-    success: true,
-    savedBuilds: user.savedBuilds || [],
-    userId: user.id,
-  });
 });
 
-app.post('/api/user/saved-rigs', (req: Request, res: Response) => {
-  const user = getAuthenticatedUser(req);
-  if (!user) {
-    logSecurityEvent({
-      eventType: 'IDOR_ACCESS_DENIED',
-      severity: 'WARN',
-      ip: getClientIp(req),
-      details: { path: req.path },
-    });
-    return res.status(401).json({ error: 'Требуется авторизация' });
+app.post('/api/user/saved-rigs', async (req: Request, res: Response) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+    if (!user) {
+      logSecurityEvent({ eventType: 'IDOR_ACCESS_DENIED', severity: 'WARN', ip: getClientIp(req),
+        details: { path: req.path } });
+      return res.status(401).json({ error: 'Требуется авторизация' });
+    }
+    const parsed = SaveRigsBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Некорректный формат данных сборки' });
+    }
+    await updateSavedBuilds(user.email, parsed.data.savedBuilds);
+    return res.json({ success: true, message: 'Сборки успешно сохранены в защищённом облаке' });
+  } catch (error) {
+    console.error('Error saving saved rigs:', error);
+    return res.status(500).json({ error: 'Ошибка сохранения сборок' });
   }
-
-  // Validate incoming saved build items using Zod (Level 13 & 25)
-  const parseResult = SaveRigsBodySchema.safeParse(req.body);
-  if (!parseResult.success) {
-    return res.status(400).json({ error: parseResult.error.issues[0]?.message || 'Некорректный формат данных сборки' });
-  }
-
-  const users = loadUsers();
-  users[user.email].savedBuilds = parseResult.data.savedBuilds;
-  saveUsers(users);
-
-  return res.json({ success: true, message: 'Сборки успешно сохранены в защищённом облаке' });
 });
 
 /**
