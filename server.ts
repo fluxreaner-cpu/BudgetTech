@@ -433,12 +433,20 @@ app.post('/api/auth/send-code', async (req: Request, res: Response) => {
     });
 
     const isSmtpSent = await sendVerificationEmail(cleanEmail, code, cleanName);
+    if (!isSmtpSent && isProd) {
+      await deleteVerificationCode(cleanEmail);
+      return res.status(503).json({
+        error: 'Не удалось отправить письмо с кодом. Проверьте почтовую конфигурацию и попробуйте позже.',
+      });
+    }
 
     return res.json({
       success: true,
-      message: `Код подтверждения отправлен на почту ${cleanEmail}`,
+      message: isSmtpSent
+        ? `Код подтверждения отправлен на почту ${cleanEmail}`
+        : 'Почтовый сервер не настроен: тестовый код доступен только в режиме разработки.',
       isSmtpSent,
-      ...(isProd ? {} : { debugCode: code }), // Never expose OTP in production
+      ...(isProd ? {} : { debugCode: code }),
       expiresAt,
     });
   } catch (error: any) {
