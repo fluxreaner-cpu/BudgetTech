@@ -1,4 +1,5 @@
 import { Pool, PoolClient } from 'pg';
+import crypto from 'crypto';
 
 export interface RefreshTokenRecord {
   tokenHash: string;
@@ -141,7 +142,9 @@ export async function decrementCodeAttempts(email: string): Promise<number | nul
      where email=$1 and expires_at>$2 and attempts_left>0 returning attempts_left`,
     [email.toLowerCase(),Date.now()]
   );
-  return result.rows[0]?.attempts_left ?? null;
+  const remaining = result.rows[0]?.attempts_left ?? null;
+  if (remaining === 0) await deleteVerificationCode(email);
+  return remaining;
 }
 
 export async function deleteVerificationCode(email: string): Promise<void> {
@@ -157,8 +160,21 @@ export async function createVerifiedUserFromCode(email: string, expectedCode: st
        where email=$1 for update`, [email.toLowerCase()]
     );
     const code = codeResult.rows[0];
-    if (!code || Number(code.expires_at) <= Date.now() || code.attempts_left <= 0 || code.code !== expectedCode) {
+    if (!code || Number(code.expires_at) <= Date.now() || code.attempts_left <= 0) {
       await client.query('rollback');
+      return false;
+    }
+    const supplied = Buffer.from(String(expectedCode));
+    const actual = Buffer.from(String(code.code));
+    const valid = supplied.length === actual.length && crypto.timingSafeEqual(supplied, actual);
+    if (!valid) {
+      const remaining = Number(code.attempts_left) - 1;
+      if (remaining <= 0) {
+        await client.query('delete from app_private.verification_codes where email=$1',[email.toLowerCase()]);
+      } else {
+        await client.query('update app_private.verification_codes set attempts_left=$2 where email=$1',[email.toLowerCase(),remaining]);
+      }
+      await client.query('commit');
       return false;
     }
     await client.query(
@@ -208,4 +224,48 @@ export async function revokeSession(email: string): Promise<void> {
     'update app_private.users set session_token=null,token_expires_at=null,updated_at=now() where email=$1',
     [email.toLowerCase()]
   );
+}
+
+
+export async function updateUserSession(user: StoredUser): Promise<void> {
+  await pool.query(
+    `update app_private.users set password_hash=$2,salt=$3,hash_iterations=$4,
+      last_active_at=$5,session_token=$6,token_expires_at=$7,refresh_tokens=$8::jsonb,updated_at=now()
+     where email=$1`,
+    [user.email.toLowerCase(),user.passwordHash,user.salt ?? null,user.hashIterations ?? null,
+     user.lastActiveAt ?? null,user.token ?? null,user.tokenExpiresAt ?? null,
+     JSON.stringify(user.refreshTokens ?? [])]
+  );
+}
+
+export async function rotateRefreshToken(oldHash: string, newRecord: RefreshTokenRecord,
+  newAccessToken: string, accessExpiresAt: number): Promise<StoredUser | null> {
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    const result = await client.query<UserRow>(
+      `select ${USER_COLUMNS} from app_private.users
+       where refresh_tokens @> $1::jsonb for update`,
+      [JSON.stringify([{tokenHash:oldHash}])]
+    );
+    if (!result.rows[0]) { await client.query('rollback'); return null; }
+    const user = mapUser(result.rows[0]);
+    const index = user.refreshTokens.findIndex(t => t.tokenHash === oldHash);
+    if (index < 0 || user.refreshTokens[index].expiresAt <= Date.now()) {
+      await client.query('rollback'); return null;
+    }
+    user.refreshTokens[index] = newRecord;
+    user.token = newAccessToken;
+    user.tokenExpiresAt = accessExpiresAt;
+    user.lastActiveAt = new Date().toISOString();
+    await client.query(
+      `update app_private.users set session_token=$2,token_expires_at=$3,
+       last_active_at=$4,refresh_tokens=$5::jsonb,updated_at=now() where email=$1`,
+      [user.email,newAccessToken,accessExpiresAt,user.lastActiveAt,JSON.stringify(user.refreshTokens)]
+    );
+    await client.query('commit');
+    return user;
+  } catch (error) {
+    await client.query('rollback'); throw error;
+  } finally { client.release(); }
 }
