@@ -16,24 +16,46 @@ export function httpsEnforcer(req: Request, res: Response, next: NextFunction) {
   next();
 }
 
+/** Parse an exact origin allowlist; never trust broad provider-domain suffixes. */
+function getAllowedOrigins(): Set<string> {
+  const configured = [
+    process.env.APP_URL || '',
+    ...(process.env.ALLOWED_ORIGINS || '').split(','),
+  ];
+  const allowed = new Set<string>();
+  for (const value of configured) {
+    const candidate = value.trim();
+    if (!candidate) continue;
+    try {
+      const parsed = new URL(candidate);
+      if ((parsed.protocol === 'https:' || parsed.protocol === 'http:') &&
+          parsed.origin === candidate.replace(/\\/$/, '')) {
+        allowed.add(parsed.origin);
+      }
+    } catch {
+      // Ignore malformed configuration rather than broadening the allowlist.
+    }
+  }
+  if (process.env.NODE_ENV !== 'production') {
+    allowed.add('http://localhost:3000');
+    allowed.add('http://localhost:5173');
+    allowed.add('http://127.0.0.1:3000');
+    allowed.add('http://127.0.0.1:5173');
+  }
+  return allowed;
+}
+
 /**
- * 2. Enterprise Content Security Policy & Browser Defense Headers (Levels 8, 9, 17, 18, 19)
+ * 2. Content Security Policy & Browser Defense Headers
  */
 export function browserSecurityHeaders(req: Request, res: Response, next: NextFunction) {
-  // Prevent MIME sniffing
   res.setHeader('X-Content-Type-Options', 'nosniff');
-
-  // Prevent Cross-Site Scripting filter exploitation
   res.setHeader('X-XSS-Protection', '1; mode=block');
-
-  // Strict Referrer Policy
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-
-  // Feature / Permissions Policy
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
 
-  // Do NOT send X-Frame-Options: SAMEORIGIN because it breaks Google AI Studio iframe embedding.
-  // Instead, use modern CSP frame-ancestors which explicitly allows Google, AI Studio, Cloud Run, and self.
+  const frameOrigins = [...getAllowedOrigins()].filter(origin => origin !== process.env.APP_URL);
+  const frameAncestors = ["'self'", ...frameOrigins].join(' ');
   const cspDirectives = [
     "default-src 'self' 'unsafe-inline' data: blob: https:",
     "script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: https:",
@@ -41,100 +63,74 @@ export function browserSecurityHeaders(req: Request, res: Response, next: NextFu
     "font-src 'self' https: data: fonts.gstatic.com",
     "img-src 'self' data: https: http: blob:",
     "connect-src 'self' data: blob: https: http: wss: ws:",
-    "frame-ancestors 'self' https://*.google.com https://*.googleusercontent.com https://*.run.app https://*.aistudio.google.com https://ai.google.dev *",
+    `frame-ancestors ${frameAncestors}`,
     "base-uri 'self'",
     "form-action 'self'",
   ];
-
   res.setHeader('Content-Security-Policy', cspDirectives.join('; '));
   next();
 }
 
 /**
- * 3. Strict CORS Validation (Level 20)
+ * 3. Exact CORS origin validation
  */
 export function corsValidator(req: Request, res: Response, next: NextFunction) {
   const origin = req.headers.origin;
-  const appUrl = process.env.APP_URL;
+  if (!origin) return next();
 
-  // Allow same-origin or requests without origin header (e.g. server-to-server, mobile native)
-  if (!origin) {
-    return next();
+  let normalizedOrigin: string;
+  try {
+    normalizedOrigin = new URL(origin).origin;
+    if (normalizedOrigin !== origin) throw new Error('Non-canonical origin');
+  } catch {
+    return res.status(403).json({ error: 'CORS Policy: Invalid origin', code: 'ERR_CORS_DENIED' });
   }
 
-  // Match allowed origins: includes AI Studio custom domains (*.ai.studio), Google Cloud, and localhost
-  const isAllowed = 
-    origin === appUrl ||
-    origin.includes('localhost') ||
-    origin.includes('127.0.0.1') ||
-    origin.endsWith('.run.app') ||
-    origin.endsWith('.google.com') ||
-    origin.endsWith('.ai.studio') ||
-    origin.endsWith('ai.studio') ||
-    origin.endsWith('.googleusercontent.com') ||
-    origin.endsWith('.web.app') ||
-    origin.endsWith('.firebaseapp.com');
-
-  if (isAllowed) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-CSRF-Token');
-  } else if (req.method !== 'GET' && req.method !== 'HEAD') {
-    // Only reject mutating requests from unauthorized origins
+  if (!getAllowedOrigins().has(normalizedOrigin)) {
     logSecurityEvent({
       eventType: 'CORS_VIOLATION',
       severity: 'WARN',
       ip: getClientIp(req),
-      details: { rejectedOrigin: origin, method: req.method, path: req.path },
+      details: { rejectedOrigin: normalizedOrigin, method: req.method, path: req.path },
     });
     return res.status(403).json({ error: 'CORS Policy: Origin not allowed', code: 'ERR_CORS_DENIED' });
   }
 
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(204);
-  }
-
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Origin', normalizedOrigin);
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-CSRF-Token');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 }
 
 /**
- * 4. Anti-CSRF Guard for Mutating Requests (Level 21)
+ * 4. Anti-CSRF Guard for Mutating Requests
  */
 export function csrfProtection(req: Request, res: Response, next: NextFunction) {
-  // Only check mutating requests
   const mutatingMethods = ['POST', 'PUT', 'PATCH', 'DELETE'];
-  if (!mutatingMethods.includes(req.method)) {
-    return next();
-  }
+  if (!mutatingMethods.includes(req.method)) return next();
 
   const origin = req.headers.origin;
-  const host = req.headers.host;
-
-  if (origin && host) {
+  if (origin) {
+    let normalizedOrigin: string;
     try {
-      const originHost = new URL(origin).host;
-      const isAllowedHost = 
-        originHost === host ||
-        originHost.endsWith('.run.app') ||
-        originHost.endsWith('.ai.studio') ||
-        originHost.endsWith('ai.studio') ||
-        originHost.endsWith('.google.com') ||
-        originHost.endsWith('.googleusercontent.com') ||
-        originHost.includes('localhost');
-
-      if (!isAllowedHost) {
-        logSecurityEvent({
-          eventType: 'CSRF_BLOCKED',
-          severity: 'CRITICAL',
-          ip: getClientIp(req),
-          details: { originHost, serverHost: host },
-        });
-        return res.status(403).json({ error: 'CSRF validation failed: Origin mismatch', code: 'ERR_CSRF_FAILED' });
+      normalizedOrigin = new URL(origin).origin;
+      if (normalizedOrigin !== origin || !getAllowedOrigins().has(normalizedOrigin)) {
+        throw new Error('Origin not allowed');
       }
     } catch {
-      return res.status(403).json({ error: 'CSRF validation failed: Invalid Origin', code: 'ERR_CSRF_FAILED' });
+      logSecurityEvent({
+        eventType: 'CSRF_BLOCKED',
+        severity: 'WARN',
+        ip: getClientIp(req),
+        details: { rejectedOrigin: origin, path: req.path },
+      });
+      return res.status(403).json({ error: 'CSRF validation failed: Origin not allowed', code: 'ERR_CSRF_FAILED' });
     }
+  } else if (req.headers['sec-fetch-site'] === 'cross-site') {
+    return res.status(403).json({ error: 'CSRF validation failed: Cross-site request', code: 'ERR_CSRF_FAILED' });
   }
 
   next();
