@@ -7,7 +7,7 @@ import nodemailer, { Transporter } from 'nodemailer';
 import crypto from 'crypto';
 import cookieParser from 'cookie-parser';
 import {
-  getUserByEmail, getUserBySessionToken, saveUser, saveVerificationCode,
+  getUserByEmail, getUserBySessionToken, saveVerificationCode,
   getVerificationCode, decrementCodeAttempts, deleteVerificationCode,
   createVerifiedUserFromCode, updateUserSession, findUserByRefreshHash,
   rotateRefreshToken, updateSavedBuilds, revokeSession, type StoredUser as DbStoredUser
@@ -21,8 +21,6 @@ import {
   verifyPasswordArgon2, 
   dummyArgon2Verification, 
   verifyLegacyPBKDF2, 
-  encryptField, 
-  decryptField, 
   timingSafeCompare 
 } from './server/security/cryptoEngine';
 import { 
@@ -85,8 +83,6 @@ app.use(csrfProtection);
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const BACKUPS_DIR = path.join(DATA_DIR, 'backups');
 const KEYS_DIR = path.join(DATA_DIR, 'keys');
-const USERS_FILE = path.join(DATA_DIR, 'users.json');
-const CODES_FILE = path.join(DATA_DIR, 'verification_codes.json');
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(BACKUPS_DIR)) fs.mkdirSync(BACKUPS_DIR, { recursive: true });
@@ -187,7 +183,7 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
-// --- Persistent Data Storage with Atomic Writes & Field-Level AES-256-GCM Encryption (Level 10) ---
+// PostgreSQL is the sole persistent store for users and verification codes.
 interface RefreshTokenRecord {
   tokenHash: string;
   familyId: string;
@@ -221,61 +217,6 @@ interface StoredCode {
   attemptsLeft: number;
 }
 
-function atomicWriteJson(filePath: string, data: any) {
-  try {
-    const tempPath = `${filePath}.tmp.${Date.now()}`;
-    const payload = JSON.stringify(data, null, 2);
-    fs.writeFileSync(tempPath, payload, 'utf-8');
-    fs.renameSync(tempPath, filePath);
-  } catch (err) {
-    console.error(`[Storage Engine Error] Failed atomic write for ${filePath}:`, err);
-  }
-}
-
-function loadUsers(): Record<string, StoredUser> {
-  try {
-    if (fs.existsSync(USERS_FILE)) {
-      const raw = JSON.parse(fs.readFileSync(USERS_FILE, 'utf-8'));
-      // Decrypt sensitive session token fields at rest
-      for (const email of Object.keys(raw)) {
-        if (raw[email].token) {
-          raw[email].token = decryptField(raw[email].token);
-        }
-      }
-      return raw;
-    }
-  } catch (err) {
-    console.error('Error loading users file:', err);
-  }
-  return {};
-}
-
-function saveUsers(users: Record<string, StoredUser>) {
-  // Encrypt sensitive token fields before saving to disk
-  const encryptedClone: Record<string, StoredUser> = {};
-  for (const [email, user] of Object.entries(users)) {
-    encryptedClone[email] = {
-      ...user,
-      token: user.token ? encryptField(user.token) : undefined,
-    };
-  }
-  atomicWriteJson(USERS_FILE, encryptedClone);
-}
-
-function loadCodes(): Record<string, StoredCode> {
-  try {
-    if (fs.existsSync(CODES_FILE)) {
-      return JSON.parse(fs.readFileSync(CODES_FILE, 'utf-8'));
-    }
-  } catch (err) {
-    console.error('Error loading codes file:', err);
-  }
-  return {};
-}
-
-function saveCodes(codes: Record<string, StoredCode>) {
-  atomicWriteJson(CODES_FILE, codes);
-}
 
 // User Response Sanitizer (Guarantees zero password, salt, or hash leakage)
 function sanitizeUserResponse(user: StoredUser) {
@@ -365,10 +306,10 @@ async function sendVerificationEmail(toEmail: string, code: string, recipientNam
     }
   }
 
-  // Simulated delivery log
-  console.log(`====================================================`);
-  console.log(`[VERIFICATION EMAIL SENT] To: ${toEmail} | Code: ${code}`);
-  console.log(`====================================================`);
+  // Never log verification codes or report a simulated delivery.
+  if (!mailTransporter && !isProd) {
+    console.warn('[SMTP] Not configured; verification email was not sent.');
+  }
   return false;
 }
 
