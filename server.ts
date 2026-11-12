@@ -10,7 +10,7 @@ import {
   getUserByEmail, getUserBySessionToken, saveVerificationCode,
   getVerificationCode, decrementCodeAttempts, deleteVerificationCode,
   createVerifiedUserFromCode, updateUserSession, findUserByRefreshHash,
-  rotateRefreshToken, updateSavedBuilds, revokeSession, type StoredUser as DbStoredUser
+  rotateRefreshToken, updateSavedBuilds, revokeSession, touchUserSession, type StoredUser as DbStoredUser
 } from './server/storage/postgresStore';
 
 
@@ -696,8 +696,7 @@ app.get('/api/auth/me', async (req: Request, res: Response) => {
       clearAuthCookies(res);
       return res.status(401).json({ error: 'Сессия истекла или недействительна' });
     }
-    user.lastActiveAt = new Date().toISOString();
-    await updateUserSession(user as DbStoredUser);
+    await touchUserSession(user.email);
     return res.json({ success: true, user: sanitizeUserResponse(user) });
   } catch (error) {
     console.error('Error in /api/auth/me:', error);

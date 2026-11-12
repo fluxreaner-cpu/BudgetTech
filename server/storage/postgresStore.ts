@@ -220,7 +220,11 @@ export async function updateSavedBuilds(email: string, builds: unknown[]): Promi
   );
 }
 
-export async function touchUserSession(email: string): Promise<void> {\n  await pool.query('update app_private.users set last_active_at=now(),updated_at=now() where email=$1',[email.toLowerCase()]);\n}\n\nexport async function revokeSession(email: string): Promise<void> {
+export async function touchUserSession(email: string): Promise<void> {
+  await pool.query('update app_private.users set last_active_at=now(),updated_at=now() where email=$1',[email.toLowerCase()]);
+}
+
+export async function revokeSession(email: string): Promise<void> {
   await pool.query(
     'update app_private.users set session_token_hash=null,token_expires_at=null,updated_at=now() where email=$1',
     [email.toLowerCase()]
