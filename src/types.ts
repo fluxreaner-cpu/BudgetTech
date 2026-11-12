@@ -55,7 +55,6 @@ export interface UserSession {
   avatarSeed: string;
   joinDate: string;
   savedBuildCount: number;
-  token?: string;
   isVerified?: boolean;
   isGuest?: boolean;
 }

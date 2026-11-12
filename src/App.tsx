@@ -96,22 +96,21 @@ export default function App() {
   const [isBrandModalOpen, setIsBrandModalOpen] = useState(false);
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
 
-  // Restore and validate server-verified user profile on mount
+  // Restore the session using the HttpOnly cookie; bearer tokens stay out of localStorage.
   useEffect(() => {
-    const token = localStorage.getItem('budgettech_token');
-    if (token) {
-      fetch('/api/auth/me', {
-        headers: { Authorization: `Bearer ${token}` },
+    localStorage.removeItem('budgettech_token');
+    fetch('/api/auth/me', { credentials: 'same-origin' })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (data && data.user) {
+          setUserSession(data.user);
+          localStorage.setItem('budgettech_user_session', JSON.stringify(data.user));
+        } else {
+          localStorage.removeItem('budgettech_user_session');
+          setUserSession(null);
+        }
       })
-        .then((res) => (res.ok ? res.json() : null))
-        .then((data) => {
-          if (data && data.user) {
-            setUserSession(data.user);
-            localStorage.setItem('budgettech_user_session', JSON.stringify(data.user));
-          }
-        })
-        .catch((err) => console.error('Failed to restore session:', err));
-    }
+      .catch((err) => console.error('Failed to restore session:', err));
   }, []);
 
   // Close sorting dropdown on outside click
@@ -245,16 +244,13 @@ export default function App() {
 
   // Logout handler
   const handleLogout = async () => {
-    const token = localStorage.getItem('budgettech_token');
-    if (token) {
-      try {
-        await fetch('/api/auth/logout', {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${token}` },
-        });
-      } catch (err) {
-        console.error(err);
-      }
+    try {
+      await fetch('/api/auth/logout', {
+        method: 'POST',
+        credentials: 'same-origin',
+      });
+    } catch (err) {
+      console.error(err);
     }
     localStorage.removeItem('budgettech_token');
     localStorage.removeItem('budgettech_user_session');

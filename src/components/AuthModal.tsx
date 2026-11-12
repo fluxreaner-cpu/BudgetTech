@@ -150,8 +150,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         throw new Error(data.error || 'Неверный код подтверждения');
       }
 
-      // Save persistent token and session
-      localStorage.setItem('budgettech_token', data.token);
+      // The server stores the session in an HttpOnly cookie; only the profile is cached locally.
+      localStorage.removeItem('budgettech_token');
       localStorage.setItem('budgettech_user_session', JSON.stringify(data.user));
 
       onLoginSuccess(data.user);
@@ -230,7 +230,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         throw new Error(data.error || 'Неверный email или пароль');
       }
 
-      localStorage.setItem('budgettech_token', data.token);
+      localStorage.removeItem('budgettech_token');
       localStorage.setItem('budgettech_user_session', JSON.stringify(data.user));
 
       onLoginSuccess(data.user);

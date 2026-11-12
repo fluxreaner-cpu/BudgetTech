@@ -214,7 +214,7 @@ interface StoredUser {
   lastActiveAt?: string;
   isVerified: boolean;
   avatarSeed: string;
-  token?: string; // Encrypted at rest
+  token?: string; // Ephemeral bearer secret; never returned in JSON
   tokenExpiresAt?: number;
   refreshTokens?: RefreshTokenRecord[];
   savedBuilds?: any[];
@@ -239,7 +239,6 @@ function sanitizeUserResponse(user: StoredUser) {
     avatarSeed: user.avatarSeed,
     joinDate: new Date(user.createdAt).toLocaleDateString(),
     savedBuildCount: (user.savedBuilds || []).length,
-    token: user.token,
     isVerified: user.isVerified,
   };
 }
@@ -501,7 +500,7 @@ app.post('/api/auth/verify-code', async (req: Request, res: Response) => {
     logSecurityEvent({ eventType: 'AUTH_REGISTER_CONFIRMED', severity: 'INFO', ip: clientIp,
       identifier: cleanEmail, details: { userId: newUser.id } });
     return res.json({ success: true, message: 'Регистрация успешно подтверждена!',
-      user: sanitizeUserResponse(newUser), token });
+      user: sanitizeUserResponse(newUser) });
   } catch (error) {
     console.error('Error in /api/auth/verify-code:', error);
     return res.status(500).json({ error: 'Ошибка при проверке кода' });
@@ -636,7 +635,6 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
     return res.json({
       success: true,
       user: sanitizeUserResponse(user),
-      token,
     });
   } catch (error: any) {
     console.error('Error in /api/auth/login:', error);
@@ -683,7 +681,7 @@ app.post('/api/auth/refresh', async (req: Request, res: Response) => {
     setAuthCookies(res, newAccess, newRefresh);
     logSecurityEvent({ eventType: 'AUTH_TOKEN_ROTATED', severity: 'INFO', ip: clientIp,
       identifier: rotated.email, details: { familyId: oldRecord.familyId, generation: oldRecord.generation + 1 } });
-    return res.json({ success: true, token: newAccess, user: sanitizeUserResponse(rotated) });
+    return res.json({ success: true, user: sanitizeUserResponse(rotated) });
   } catch (error) {
     console.error('Error in /api/auth/refresh:', error);
     return res.status(500).json({ error: 'Ошибка обновления токена' });
